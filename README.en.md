@@ -1,7 +1,6 @@
-# dsh-plugin-git-inspect
+# @navidrashik/dsh-plugin-git-inspect
 
-> **v0.3.6 compatibility update**: verified against Harness `0.1.5-rc.2` and the `0.1.1-rc.2` baseline. Web plugins no longer request the retired runtime module. Download links below target the fixed archive; other host versions require verification.
-
+> **Security-audited fork** of [`Wanbinyu/dsh-plugin-git-inspect`](https://github.com/Wanbinyu/dsh-plugin-git-inspect) at commit `3e7de56` (v0.3.6), adding merge-base branch diffs and GitHub pull-request diffs. See [SECURITY-AUDIT.md](SECURITY-AUDIT.md) for the audit record and the **mandatory re-audit procedure before every upstream update**.
 
 [简体中文](README.md) | [English](README.en.md)
 
@@ -14,12 +13,15 @@ Read-only Git visibility for agents running inside [DeepSeek Harness](https://gi
 
 ## What It Adds
 
-The plugin registers ten read-only model-facing tools:
+The plugin registers thirteen read-only model-facing tools:
 
 | Tool | Purpose | Optional arguments |
 | --- | --- | --- |
 | `git_status` | Show the current branch and working-tree status. | None |
 | `git_diff` | Show the working-tree diff or the staged index diff. | `staged`, `path` |
+| **`git_diff_branch`** | **Show what the current branch changed vs. a base branch, from the merge base (`base...head`). The pre-pull-request review view.** | `base`, `head`, `stat`, `path` |
+| **`git_diff_pr`** | **Show a GitHub pull-request diff via the authenticated `gh` CLI.** | `pr` (required), `repo`, `nameOnly` |
+| **`git_pr_info`** | **Show pull-request metadata (state, author, branches, +/-, mergeability).** | `pr` (required), `repo` |
 | `git_diff_stat` | Show a file-level summary of changes. | `staged`, `path` |
 | `git_log` | Show recent commits in compact one-line form. | `maxCount`, `path` |
 | `git_show` | Show a selected commit, tag, or other revision. | `revision`, `path` |
@@ -30,6 +32,39 @@ The plugin registers ten read-only model-facing tools:
 | `git_worktree_list` | List registered worktrees in stable porcelain format. | None |
 
 The working directory comes from the active Harness session (`session.header.cwd`). When a session does not provide one, the plugin falls back to the host process working directory.
+
+## Branch And Pull-Request Diffs
+
+Ask the agent naturally:
+
+- "What did this branch change?" → `git_diff_branch`
+- "Diff my branch against develop" → `git_diff_branch` with `base: "develop"`
+- "Just the file summary" → `git_diff_branch` with `stat: true`
+- "Show me PR 3920" → `git_diff_pr` with `pr: 3920`
+- "Review PR 12 in owner/repo" → `git_pr_info` + `git_diff_pr` with `repo: "owner/repo"`
+
+**`git_diff_branch` uses three-dot (`base...head`) merge-base semantics.** It
+shows only what your branch introduced — commits that landed on the base branch
+after you branched are excluded. That is what makes it a truthful "my changes"
+view rather than a confusing mix of both branches.
+
+When `base` is omitted it auto-detects `origin/main`, `origin/master`, `main`,
+`master`, then the upstream tracking ref, verifying each with `merge-base`.
+
+### Pull-request tools: requirements and credential model
+
+`git_diff_pr` and `git_pr_info` require the [GitHub CLI](https://cli.github.com)
+on `PATH` and a completed `gh auth login`.
+
+- The plugin **never reads, stores, forwards, or logs a token.** It injects no
+  `GH_TOKEN` or `GITHUB_TOKEN` and reads neither from the environment.
+- `gh` uses your ambient authentication, so `gh auth logout` immediately revokes
+  this plugin's GitHub access too.
+- Only `gh pr diff` and `gh pr view` are ever spawned — never `merge`, `close`,
+  `comment`, or `checkout`. A test enforces this.
+- **These two tools reach the network** (`api.github.com`, through `gh`), unlike
+  every other tool here. Use `git_diff_branch` if you need a strictly offline
+  review tool.
 
 ## Safety Model
 

@@ -1,7 +1,7 @@
 {
-  "name": "dsh-plugin-git-inspect",
-  "version": "0.3.6",
-  "description": "Read-only Git inspection tools for DeepSeek Harness",
+  "name": "@navidrashik/dsh-plugin-git-inspect",
+  "version": "0.4.0",
+  "description": "Read-only Git inspection tools for DeepSeek Harness, plus merge-base branch diffs and GitHub pull-request diffs. Security-audited fork of Wanbinyu/dsh-plugin-git-inspect.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -34,10 +34,10 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Wanbinyu/dsh-plugin-git-inspect.git"
+    "url": "git+https://github.com/navidRashik/dsh-plugin-git-inspect.git"
   },
   "bugs": {
-    "url": "https://github.com/Wanbinyu/dsh-plugin-git-inspect/issues"
+    "url": "https://github.com/navidRashik/dsh-plugin-git-inspect/issues"
   },
   "engines": {
     "node": ">=22.19.0"
@@ -78,5 +78,11 @@
     "@types/node": "^22.20.0",
     "typescript": "5.9.3",
     "vitest": "^4.1.8"
+  },
+  "upstream": {
+    "repository": "https://github.com/Wanbinyu/dsh-plugin-git-inspect",
+    "auditedCommit": "3e7de5648dd3a8e804da7258991c7ddc47b2a01b",
+    "auditedVersion": "0.3.6",
+    "auditedOn": "2026-09-13"
   }
 }

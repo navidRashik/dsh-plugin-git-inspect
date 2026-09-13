@@ -1,6 +1,6 @@
 - insert:
     - id: git-inspect
-      name: dsh-plugin-git-inspect
+      name: '@navidrashik/dsh-plugin-git-inspect'
       config:
         timeoutMs: 30000
         maxOutputBytes: 200000

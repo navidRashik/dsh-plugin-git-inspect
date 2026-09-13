@@ -40,7 +40,7 @@ export const Config: z<Config> = z.object({
 })
 
 type ResolvedConfig = Required<Config>
-type GitOperation = 'status' | 'diff' | 'diff_stat' | 'log' | 'show' | 'refs' | 'conflicts' | 'blame' | 'stash_list' | 'worktree_list'
+type GitOperation = 'status' | 'diff' | 'diff_stat' | 'log' | 'show' | 'refs' | 'conflicts' | 'blame' | 'stash_list' | 'worktree_list' | 'diff_branch' | 'merge_base' | 'upstream' | 'pr_diff' | 'pr_view'
 
 export interface GitResult {
   operation: GitOperation
@@ -133,6 +133,64 @@ export function buildShowArgs(revision: string, path?: string): string[] {
     revision,
     '--',
     ...(path === undefined ? [] : [path]),
+  ]
+}
+
+export function buildDiffBranchArgs(base: string, head: string, statOnly: boolean, path?: string): string[] {
+  return [
+    ...GIT_PREFIX,
+    'diff',
+    '--no-ext-diff',
+    '--no-textconv',
+    '--no-color',
+    ...(statOnly ? ['--stat'] : []),
+    '--end-of-options',
+    // Three-dot: diff from the MERGE BASE of base..head, i.e. only what this
+    // branch introduced — not unrelated commits that landed on base meanwhile.
+    `${base}...${head}`,
+    '--',
+    ...(path === undefined ? [] : [path]),
+  ]
+}
+
+export function buildMergeBaseArgs(base: string, head: string): string[] {
+  return [
+    ...GIT_PREFIX,
+    'merge-base',
+    '--end-of-options',
+    base,
+    head,
+  ]
+}
+
+export function buildUpstreamArgs(): string[] {
+  return [
+    ...GIT_PREFIX,
+    'rev-parse',
+    '--abbrev-ref',
+    '--symbolic-full-name',
+    '@{upstream}',
+  ]
+}
+
+export function buildPrDiffArgs(pr: number, repo: string | undefined, nameOnly: boolean): string[] {
+  return [
+    'pr',
+    'diff',
+    String(pr),
+    ...(nameOnly ? ['--name-only'] : []),
+    ...(repo === undefined ? [] : ['--repo', repo]),
+  ]
+}
+
+export function buildPrViewArgs(pr: number, repo: string | undefined): string[] {
+  return [
+    'pr',
+    'view',
+    String(pr),
+    '--json',
+    'number,title,state,isDraft,author,baseRefName,headRefName,additions,deletions,changedFiles,url,mergeable',
+    ...(repo === undefined ? [] : ['--repo', repo]),
   ]
 }
 
@@ -247,6 +305,46 @@ function requiredPath(path: string): string {
   return path
 }
 
+// Defence in depth. Every git call already uses a fixed argv vector (no shell)
+// and puts `--end-of-options` before user-controlled revisions, so neither
+// shell metacharacters nor a leading `-` can be reinterpreted. These checks
+// reject malformed refs early with a clear message instead of deferring to a
+// confusing git error, and keep the guarantee if a future edit ever drops
+// `--end-of-options`.
+const REF_FORBIDDEN = /[\x00-\x20~^:?*[\\\]"'`$;|&<>()!{}]/
+const REPO_PATTERN = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/
+
+export function validateRef(name: string, value: string): string {
+  const ref = value.trim()
+  if (ref.length === 0) throw new Error(`git-inspect: ${name} must be a non-empty git ref`)
+  if (ref.length > 255) throw new Error(`git-inspect: ${name} is too long (max 255 characters)`)
+  if (ref.startsWith('-')) throw new Error(`git-inspect: ${name} must not start with "-"`)
+  if (REF_FORBIDDEN.test(ref)) throw new Error(`git-inspect: ${name} contains characters that are not valid in a git ref`)
+  if (ref.includes('..')) throw new Error(`git-inspect: ${name} must be a single ref, not a range`)
+  if (ref.endsWith('.lock') || ref.endsWith('/') || ref.endsWith('.')) throw new Error(`git-inspect: ${name} is not a well-formed git ref`)
+  if (ref.includes('//')) throw new Error(`git-inspect: ${name} is not a well-formed git ref`)
+  if (ref === '@') throw new Error(`git-inspect: ${name} must not be the bare "@" ref`)
+  return ref
+}
+
+export function validateRepo(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined
+  const repo = value.trim()
+  if (repo.length === 0) throw new Error('git-inspect: repo must be a non-empty "owner/name" string when given')
+  // A hyphen is legal inside a GitHub owner name, so REPO_PATTERN alone would
+  // accept "--flag/x". gh receives this as the value of --repo rather than as
+  // a bare word, but reject a leading "-" anyway so the argv can never be
+  // reinterpreted as an option if the call shape changes.
+  if (repo.startsWith('-')) throw new Error('git-inspect: repo must not start with "-"')
+  if (!REPO_PATTERN.test(repo)) throw new Error('git-inspect: repo must look like "owner/name"')
+  return repo
+}
+
+export function validatePrNumber(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 1) throw new Error('git-inspect: pr must be a positive integer')
+  return value
+}
+
 function boundedLogCount(value: number | undefined, config: ResolvedConfig): number {
   const count = value ?? config.defaultLogCount
   assertPositiveInteger('maxCount', count)
@@ -334,6 +432,116 @@ async function runGit(
   }
 }
 
+/**
+ * Run the GitHub CLI with a fixed argv vector.
+ *
+ * Credential model: `gh` is invoked as an already-authenticated CLI. This
+ * plugin never reads, stores, forwards, or logs a token — no GH_TOKEN or
+ * GITHUB_TOKEN is injected here, and none is read from the environment. The
+ * child inherits whatever ambient auth the user's own `gh` already has, so
+ * revoking `gh auth` revokes this plugin's access too.
+ *
+ * Unlike the git tools, this one does reach the network (api.github.com via
+ * gh). It stays read-only: only `pr diff` and `pr view` are ever spawned.
+ */
+async function runGh(
+  ctx: Context,
+  exec: ToolRunContext,
+  operation: GitOperation,
+  argv: readonly string[],
+  config: ResolvedConfig,
+): Promise<GitResult> {
+  if (exec.signal.aborted) throw new Error(`gh ${operation} was aborted before start`)
+  const cwd = exec.agent?.session.header.cwd?.trim() || process.cwd()
+  let executable: string
+  try {
+    executable = await ctx.subprocess.resolveExecutable('gh', undefined, exec.signal)
+  } catch (error: unknown) {
+    throw new Error(
+      'git-inspect: the GitHub CLI (`gh`) was not found on PATH. Install it from https://cli.github.com and run `gh auth login` to use the pull-request tools.',
+      { cause: error },
+    )
+  }
+  const handle = ctx.subprocess.spawn({
+    argv: [executable, ...argv],
+    cwd,
+    stdio: {
+      stdin: 'ignore',
+      stdout: { maxBytes: config.maxOutputBytes },
+      stderr: { maxBytes: config.stderrMaxBytes },
+    },
+    graceMs: config.graceMs,
+    signal: exec.signal,
+    env: {
+      GIT_TERMINAL_PROMPT: '0',
+      GH_PROMPT_DISABLED: '1',
+      GH_PAGER: 'cat',
+      GH_NO_UPDATE_NOTIFIER: '1',
+      CLICOLOR: '0',
+      NO_COLOR: '1',
+    },
+  })
+
+  let outcome: { exitCode: number | null; signal: string | null }
+  try {
+    outcome = await handle.done
+  } catch (error: unknown) {
+    throw new Error(`gh ${operation} could not start: ${String(error)}`, { cause: error })
+  }
+  if (exec.signal.aborted) throw new Error(`gh ${operation} was aborted`)
+  const streams = collected(handle)
+  if (outcome.signal !== null || outcome.exitCode === null) {
+    throw new Error(`gh ${operation} was terminated by ${outcome.signal ?? 'an unknown signal'}`)
+  }
+  const stdout = normalize(streams.stdout.text)
+  const stderr = normalize(streams.stderr.text)
+  if (outcome.exitCode !== 0) {
+    const detail = stderr.trim() || stdout.trim() || 'no diagnostic output'
+    if (/auth|login|credential|unauthorized|HTTP 401/i.test(detail)) {
+      throw new Error(`gh ${operation} failed: not authenticated. Run \`gh auth login\`. Detail: ${detail}`)
+    }
+    throw new Error(`gh ${operation} failed with exit code ${outcome.exitCode}: ${detail}`)
+  }
+  return {
+    operation,
+    cwd,
+    stdout,
+    stderr,
+    truncated: streams.stdout.lossy || streams.stderr.lossy,
+  }
+}
+
+export const BASE_CANDIDATES = ['origin/main', 'origin/master', 'main', 'master'] as const
+
+/**
+ * Pick a base ref for a branch diff when the caller did not name one.
+ *
+ * Tries the conventional integration branches first, then the branch's own
+ * upstream tracking ref. Every candidate is verified with `merge-base`, so a
+ * ref that exists but shares no history is skipped rather than producing a
+ * misleading whole-history diff.
+ */
+async function detectBase(ctx: Context, exec: ToolRunContext, config: ResolvedConfig): Promise<string> {
+  for (const candidate of BASE_CANDIDATES) {
+    try {
+      await runGit(ctx, exec, 'merge_base', buildMergeBaseArgs(candidate, 'HEAD'), config)
+      return candidate
+    } catch {
+      // Candidate missing or unrelated to HEAD — try the next one.
+    }
+  }
+  try {
+    const upstream = await runGit(ctx, exec, 'upstream', buildUpstreamArgs(), config)
+    const ref = upstream.stdout.trim()
+    if (ref.length > 0) return validateRef('upstream', ref)
+  } catch {
+    // No upstream configured.
+  }
+  throw new Error(
+    'git-inspect: could not auto-detect a base branch (tried origin/main, origin/master, main, master, and the upstream tracking ref). Pass base explicitly, e.g. base: "develop".',
+  )
+}
+
 function renderResult(value: Pick<GitResult, 'stdout' | 'stderr' | 'truncated'>): string {
   const body = value.stdout.trimEnd()
   const stderr = value.stderr.trim()
@@ -357,7 +565,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   ctx.systemPrompt.section({
     name: 'tool:git-inspect',
     order: 104,
-    text: 'Use git_status, git_diff, git_diff_stat, git_log, git_show, git_refs, git_conflicts, git_blame, git_stash_list, and git_worktree_list for read-only repository inspection. These tools do not commit, push, reset, create stashes, switch worktrees, or modify files.',
+    text: 'Use git_status, git_diff, git_diff_stat, git_log, git_show, git_refs, git_conflicts, git_blame, git_stash_list, and git_worktree_list for read-only repository inspection. For "what did this branch change" or pre-pull-request review, use git_diff_branch, which diffs from the merge base with the base branch rather than the raw branch tip. For a GitHub pull request, use git_diff_pr for the patch and git_pr_info for its metadata; both go through the authenticated GitHub CLI. These tools do not commit, push, reset, create stashes, switch worktrees, merge or comment on pull requests, or modify files.',
   })
 
   ctx.tools.register(defineTool({
@@ -448,6 +656,76 @@ export function apply(ctx: Context, config: Config = {}): void {
       return runGit(ctx, exec, 'show', buildShowArgs(revision, path), resolved)
     },
     presentCall: args => callView(`Git show ${args.revision}`, args.path),
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'git_diff_branch',
+    description: 'Show what the current branch changed relative to a base branch, using the merge base (base...head) so commits that landed on the base afterwards are excluded. This is the "diff of my branch" / pre-pull-request review view. Read-only. When base is omitted the plugin auto-detects origin/main, origin/master, main, master, or the upstream tracking ref.',
+    parameters: {
+      base: { type: 'string', description: 'Base branch or ref to compare against, e.g. "main" or "origin/main". Auto-detected when omitted.' },
+      head: { type: 'string', description: 'Head ref to compare; defaults to HEAD (the current branch).' },
+      stat: { type: 'boolean', description: 'Show only the file-level +/- summary instead of the full patch.' },
+      path: { type: 'string', description: 'Limit the diff to one repository-relative path.' },
+    },
+    timeoutMs: resolved.timeoutMs,
+    output: {
+      schema: gitOutputSchema,
+      render: (_args, value) => [{ type: 'text', text: renderResult(value) }],
+    },
+    execute: async (args, exec) => {
+      const head = args.head === undefined ? 'HEAD' : validateRef('head', args.head)
+      const base = args.base === undefined
+        ? await detectBase(ctx, exec, resolved)
+        : validateRef('base', args.base)
+      const path = optionalPath(args.path)
+      const result = await runGit(ctx, exec, 'diff_branch', buildDiffBranchArgs(base, head, args.stat === true, path), resolved)
+      if (result.stdout.trim().length === 0) {
+        return { ...result, stdout: `(no changes between ${base} and ${head})` }
+      }
+      return { ...result, stdout: `# diff ${base}...${head}\n\n${result.stdout}` }
+    },
+    presentCall: args => callView(`Git branch diff (${args.base ?? 'auto'}...${args.head ?? 'HEAD'})`, args.path),
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'git_diff_pr',
+    description: 'Show the diff of a GitHub pull request through the authenticated GitHub CLI (`gh`). Read-only: it never checks out, merges, comments on, or modifies the pull request. Requires `gh` on PATH and a completed `gh auth login`; this tool reads no token itself and reaches api.github.com only through gh.',
+    parameters: {
+      pr: { type: 'number', required: true, description: 'Pull-request number, e.g. 3920.' },
+      repo: { type: 'string', description: 'Target repository as "owner/name". Defaults to the repository of the current working directory.' },
+      nameOnly: { type: 'boolean', description: 'List only the changed file names instead of the full patch.' },
+    },
+    timeoutMs: resolved.timeoutMs,
+    output: {
+      schema: gitOutputSchema,
+      render: (_args, value) => [{ type: 'text', text: renderResult(value) }],
+    },
+    execute: async (args, exec) => {
+      const pr = validatePrNumber(args.pr)
+      const repo = validateRepo(args.repo)
+      return runGh(ctx, exec, 'pr_diff', buildPrDiffArgs(pr, repo, args.nameOnly === true), resolved)
+    },
+    presentCall: args => callView(`GitHub PR #${args.pr} diff`, args.repo),
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'git_pr_info',
+    description: 'Show metadata for a GitHub pull request (title, state, draft flag, author, base and head branches, additions/deletions, changed-file count, mergeability, URL) through the authenticated GitHub CLI. Read-only; pairs with git_diff_pr for review context.',
+    parameters: {
+      pr: { type: 'number', required: true, description: 'Pull-request number.' },
+      repo: { type: 'string', description: 'Target repository as "owner/name". Defaults to the repository of the current working directory.' },
+    },
+    timeoutMs: resolved.timeoutMs,
+    output: {
+      schema: gitOutputSchema,
+      render: (_args, value) => [{ type: 'text', text: renderResult(value) }],
+    },
+    execute: async (args, exec) => {
+      const pr = validatePrNumber(args.pr)
+      const repo = validateRepo(args.repo)
+      return runGh(ctx, exec, 'pr_view', buildPrViewArgs(pr, repo), resolved)
+    },
+    presentCall: args => callView(`GitHub PR #${args.pr} info`, args.repo),
   }))
 
   ctx.tools.register(defineTool({
