@@ -131,3 +131,46 @@ npm ci && npm run verify
 **Escalate instead of merging** if an upstream change introduces: any shell
 invocation, a new runtime dependency, a lifecycle script, any network call in
 the git tools, any environment/token read, or any mutating git/gh subcommand.
+
+## How the install enforces re-auditing
+
+The plugin is installed into the dsh `web` profile pinned to an exact commit,
+in two independent places. Both must be updated by hand to move to a new
+version — neither can drift on its own:
+
+1. **`package.json`** — `github:navidRashik/dsh-plugin-git-inspect#<sha>`, and
+   `pnpm-lock.yaml` records the tarball with a `sha512` integrity hash.
+2. **`pnpm-workspace.yaml` → `allowBuilds`** — keyed by the exact commit
+   tarball URL. pnpm refuses to run this package's `prepare` build script under
+   any *other* commit until that key is updated.
+
+So a future update cannot install silently: pnpm hard-fails with
+`ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED` until someone edits the allowlist, and
+that edit is the checkpoint where the re-audit above must happen.
+
+### Update flow
+
+```sh
+# after completing the re-audit procedure above and pushing the new commit
+cd ~/.dsh/profiles/web
+# 1. bump the pinned sha in package.json
+# 2. update the allowBuilds key in pnpm-workspace.yaml to the new tarball URL
+# 3. reinstall and restart dsh
+pnpm install
+```
+
+## Verification performed at install time
+
+| Check | Result |
+|---|---|
+| `npm run verify` (typecheck + tests + build + pack) | ✅ 18/18 tests |
+| Registered tool count in a live harness context | ✅ 13 tools |
+| `git_diff_branch` on a real repo | ✅ shows branch changes |
+| Merge-base semantics | ✅ a commit landing on the base *after* branching is excluded |
+| Base auto-detection | ✅ resolves without an explicit base |
+| `stat` mode | ✅ file-level summary |
+| Injection guards (`--upload-pack=…`, `$(touch …)`, `a;id`) | ✅ all rejected before spawn; `/tmp/pwned` never created |
+| Malformed repo / negative PR number | ✅ rejected |
+| `git_pr_info` against `cli/cli#14373` | ✅ real metadata returned |
+| `git_diff_pr` (name-only and full patch) | ✅ real patch returned |
+| Composed profile config (`dsh web --dump-config`) | ✅ mounted as `git-inspect` |
